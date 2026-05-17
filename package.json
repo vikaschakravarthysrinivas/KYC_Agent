@@ -8,15 +8,19 @@
     "server": "tsx src/server.ts",
     "dev": "concurrently -n api,web -c blue,magenta \"tsx src/server.ts\" \"vite\"",
     "build:web": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:id-extract": "tsx scripts/test-id-extract.ts",
+    "test:face-match": "tsx scripts/test-face-match.ts"
   },
   "dependencies": {
     "@openai/agents": "^0.3.7",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
+    "openai": "^6.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "sharp": "^0.34.5",
     "zod": "^4.1.12"
   },
   "devDependencies": {

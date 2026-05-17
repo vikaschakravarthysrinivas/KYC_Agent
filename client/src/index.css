@@ -499,3 +499,178 @@ body {
   outline: 3px solid rgba(91, 33, 182, 0.35);
   outline-offset: 2px;
 }
+
+.id-upload {
+  border: 2px solid var(--pf-purple-light);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin: 0 0 1.25rem;
+  background: var(--pf-purple-muted);
+}
+
+.id-upload legend {
+  font-weight: 600;
+  color: var(--pf-purple);
+  padding: 0 0.35rem;
+}
+
+.file-field input[type='file'] {
+  display: block;
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.65rem;
+  border: 1px dashed var(--pf-purple);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+
+.file-name {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--pf-text-muted);
+  word-break: break-all;
+}
+
+.id-upload__row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 640px) {
+  .id-upload__row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.id-preview {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.id-preview img {
+  max-width: 220px;
+  max-height: 140px;
+  object-fit: contain;
+  border: 1px solid var(--pf-border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.face-preview-pair figure {
+  margin: 0;
+}
+
+.face-preview-pair figcaption {
+  font-size: 0.75rem;
+  color: var(--pf-text-muted);
+  margin-top: 0.25rem;
+}
+
+.id-upload--selfie {
+  margin-top: 0.5rem;
+  border-color: var(--pf-purple-light);
+}
+
+.file-name--warn {
+  color: var(--pf-warning, #b45309);
+  font-weight: 600;
+}
+
+.panel--face {
+  border-left: 4px solid #8b5cf6;
+}
+
+.face-match-details {
+  margin: 1rem 0 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 1rem;
+  font-size: 0.9rem;
+}
+
+.face-match-details dt {
+  font-weight: 600;
+  color: var(--pf-text-muted);
+}
+
+.face-match-details dd {
+  margin: 0;
+}
+
+.panel--id {
+  margin-top: 1rem;
+}
+
+.panel--progress {
+  border-left: 4px solid var(--pf-purple-light);
+}
+
+.panel--extract {
+  border-left: 4px solid #0ea5e9;
+}
+
+.progress-log {
+  margin: 0;
+  padding-left: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--pf-text);
+}
+
+.progress-log li {
+  margin-bottom: 0.35rem;
+}
+
+.progress-log__active {
+  list-style: none;
+  margin-left: -1.25rem;
+  color: var(--pf-purple);
+  font-weight: 600;
+}
+
+.id-details {
+  margin: 0.75rem 0 1rem;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin-top: 0.75rem;
+}
+
+.compare-table th,
+.compare-table td {
+  border: 1px solid var(--pf-border);
+  padding: 0.5rem 0.65rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.compare-table th {
+  background: var(--pf-purple-muted);
+  font-weight: 600;
+}
+
+.field-status {
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.field-status--ok {
+  color: var(--pf-success);
+}
+
+.field-status--bad {
+  color: var(--pf-danger);
+}
+
+.field-status--warn {
+  color: var(--pf-warn);
+}

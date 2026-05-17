@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 
 type ReviewerExchange = {
   role: 'reviewer' | 'analyst';
@@ -41,6 +41,142 @@ type FormState = {
   selfie: boolean;
 };
 
+type IdCardFiles = {
+  front: File | null;
+  back: File | null;
+};
+
+type IdExtractionData = Record<string, unknown>;
+
+type KycStreamEvent = {
+  type: string;
+  message?: string;
+  extraction?: IdExtractionData;
+  normalized?: IdExtractionData;
+  verification?: IdVerificationResult;
+  idFacePreview?: string;
+  faceMatch?: FaceMatchResult;
+  tool?: string;
+  result?: {
+    report: KycReport;
+    applicantPayload: string;
+    idExtraction?: IdExtractionData;
+    idVerification?: IdVerificationResult;
+    faceMatch?: FaceMatchResult;
+    idFacePreview?: string;
+  };
+};
+
+type IdFieldResult = {
+  field: string;
+  formValue: string;
+  idValue: string;
+  status: string;
+  note?: string;
+};
+
+type IdVerificationResult = {
+  overallStatus: string;
+  fieldResults: IdFieldResult[];
+  licenseExpired?: boolean;
+  documentExpired?: boolean;
+  frontBackDlConflict?: boolean;
+};
+
+type FaceMatchResult = {
+  overallStatus: string;
+  confidenceScore: number;
+  facialFeatureNotes: string;
+  livenessNotes?: string;
+  recommendation: string;
+  idFacePreviewDataUrl?: string;
+};
+
+async function fileToBase64Payload(
+  file: File,
+): Promise<{ base64: string; mimeType: string }> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error('Read failed'));
+    reader.readAsDataURL(file);
+  });
+  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
+  if (!m) throw new Error('Could not encode image.');
+  return { base64: m[2]!, mimeType: m[1]! };
+}
+
+const KYC_STREAM_TIMEOUT_MS = 180_000;
+
+async function consumeKycStream(
+  body: unknown,
+  onEvent: (event: KycStreamEvent) => void,
+): Promise<void> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort();
+  }, KYC_STREAM_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch('/api/kyc/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    window.clearTimeout(timeout);
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(
+        `KYC request timed out after ${KYC_STREAM_TIMEOUT_MS / 1000}s. Check the API terminal for [vision] logs, set KYC_VISION_MODEL=gpt-4o in .env, or use KYC_SKIP_ID_VISION=1.`,
+      );
+    }
+    throw err;
+  }
+  window.clearTimeout(timeout);
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error ?? `Request failed (${res.status})`);
+  }
+  if (!res.body) {
+    throw new Error('No response body from stream.');
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const dataLine = part
+        .split('\n')
+        .find((l) => l.startsWith('data:'));
+      if (!dataLine) continue;
+      const json = dataLine.slice(5).trim();
+      if (!json) continue;
+      onEvent(JSON.parse(json) as KycStreamEvent);
+    }
+  }
+}
+
+function fieldStatusClass(status: string): string {
+  if (status === 'match') return 'field-status field-status--ok';
+  if (status === 'mismatch') return 'field-status field-status--bad';
+  if (status === 'partial') return 'field-status field-status--warn';
+  return 'field-status';
+}
+
+function faceMatchBadgeClass(status: string): string {
+  if (status === 'match' || status === 'likely_match') return 'badge badge--ok';
+  if (status === 'no_match') return 'badge badge--bad';
+  return 'badge badge--review';
+}
+
 const initialForm: FormState = {
   fullLegalName: '',
   dateOfBirth: '',
@@ -74,6 +210,13 @@ function badgeClass(r: KycReport['recommendation']): string {
   return 'badge badge--review';
 }
 
+function faceStatusBadgeClass(status: string): string {
+  if (status === 'match') return 'badge badge--ok';
+  if (status === 'likely_match') return 'badge badge--review';
+  if (status === 'no_match') return 'badge badge--bad';
+  return 'badge badge--review';
+}
+
 export function App() {
   const [form, setForm] = useState<FormState>(initialForm);
   const [loading, setLoading] = useState(false);
@@ -90,18 +233,48 @@ export function App() {
   const [reviewerNotes, setReviewerNotes] = useState('');
   const [decisionSubmitting, setDecisionSubmitting] = useState(false);
   const [decisionRecorded, setDecisionRecorded] = useState<unknown>(null);
+  const [idDocumentKind, setIdDocumentKind] = useState(
+    'india_driving_licence',
+  );
+  const [idFiles, setIdFiles] = useState<IdCardFiles>({ front: null, back: null });
+  const [idPreview, setIdPreview] = useState<{ front?: string; back?: string }>(
+    {},
+  );
+  const [idExtraction, setIdExtraction] = useState<IdExtractionData | null>(
+    null,
+  );
+  const [idVerification, setIdVerification] =
+    useState<IdVerificationResult | null>(null);
+  const [progressLog, setProgressLog] = useState<string[]>([]);
+  const [selfieFile, setSelfieFile] = useState<File | null>(null);
+  const [selfiePreview, setSelfiePreview] = useState<string | undefined>();
+  const [idFacePreview, setIdFacePreview] = useState<string | undefined>();
+  const [faceMatch, setFaceMatch] = useState<FaceMatchResult | null>(null);
+
+  const hasIdUpload = Boolean(idFiles.front || idFiles.back);
+
+  useEffect(() => {
+    if (!hasIdUpload) {
+      setSelfieFile(null);
+      setSelfiePreview(undefined);
+      setIdFacePreview(undefined);
+      setFaceMatch(null);
+    }
+  }, [hasIdUpload]);
 
   const canSubmit = useMemo(() => {
-    return (
+    const base =
       form.fullLegalName.trim() &&
       form.dateOfBirth.trim() &&
       form.addressLine1.trim() &&
       form.city.trim() &&
       form.stateRegion.trim() &&
       form.postalCode.trim() &&
-      form.country.trim()
-    );
-  }, [form]);
+      form.country.trim();
+    if (!base) return false;
+    if (hasIdUpload && !selfieFile) return false;
+    return true;
+  }, [form, hasIdUpload, selfieFile]);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -113,46 +286,137 @@ export function App() {
     setSelectedDecision(null);
     setReviewerNotes('');
     setDecisionRecorded(null);
+    setIdExtraction(null);
+    setIdVerification(null);
+    setIdFacePreview(undefined);
+    setFaceMatch(null);
+    setProgressLog([]);
     setLoading(true);
     try {
-      const res = await fetch('/api/kyc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fullLegalName: form.fullLegalName,
-          dateOfBirth: form.dateOfBirth,
-          nationality: form.nationality || undefined,
-          addressLine1: form.addressLine1,
-          addressLine2: form.addressLine2 || undefined,
-          city: form.city,
-          stateRegion: form.stateRegion,
-          postalCode: form.postalCode,
-          country: form.country,
-          onboardingChannel: form.onboardingChannel || undefined,
-          idDocumentType: form.idDocumentType || undefined,
-          idProofNumber: form.idProofNumber || undefined,
-          email: form.email || undefined,
-          phone: form.phone || undefined,
-          documents: {
-            applicationForm: form.applicationForm,
-            idProof: form.idProof,
-            addressProof: form.addressProof,
-            selfie: form.selfie,
-          },
-        }),
-      });
-      const data = (await res.json()) as {
-        ok: boolean;
-        report?: KycReport;
-        applicantPayload?: string;
-        error?: string;
-      };
-      if (!res.ok || !data.ok || !data.report) {
-        throw new Error(data.error ?? `Request failed (${res.status})`);
+      let idCard:
+        | {
+            documentType: string;
+            frontBase64: string;
+            frontMimeType: string;
+            backBase64?: string;
+            backMimeType?: string;
+          }
+        | undefined;
+      if (idFiles.front || idFiles.back) {
+        if (idFiles.front) {
+          const front = await fileToBase64Payload(idFiles.front);
+          idCard = {
+            documentType: idDocumentKind,
+            frontBase64: front.base64,
+            frontMimeType: front.mimeType,
+          };
+        }
+        if (idFiles.back) {
+          const back = await fileToBase64Payload(idFiles.back);
+          if (idCard) {
+            idCard.backBase64 = back.base64;
+            idCard.backMimeType = back.mimeType;
+          } else {
+            // Back-only upload: treat as single combined scan
+            idCard = {
+              documentType: idDocumentKind,
+              frontBase64: back.base64,
+              frontMimeType: back.mimeType,
+            };
+          }
+        }
       }
-      setReport(data.report);
-      setApplicantPayload(data.applicantPayload ?? null);
-      setSelectedDecision(data.report.recommendation);
+
+      const requestBody = {
+        fullLegalName: form.fullLegalName,
+        dateOfBirth: form.dateOfBirth,
+        nationality: form.nationality || undefined,
+        addressLine1: form.addressLine1,
+        addressLine2: form.addressLine2 || undefined,
+        city: form.city,
+        stateRegion: form.stateRegion,
+        postalCode: form.postalCode,
+        country: form.country,
+        onboardingChannel: form.onboardingChannel || undefined,
+        idDocumentType:
+          form.idDocumentType ||
+          (idCard ? 'India Driving Licence' : undefined),
+        idProofNumber: form.idProofNumber || undefined,
+        email: form.email || undefined,
+        phone: form.phone || undefined,
+        documents: {
+          applicationForm: form.applicationForm,
+          idProof: form.idProof,
+          addressProof: form.addressProof,
+          selfie: form.selfie,
+        },
+        idCard,
+      };
+
+      if (selfieFile) {
+        const selfie = await fileToBase64Payload(selfieFile);
+        Object.assign(requestBody, {
+          selfie: {
+            imageBase64: selfie.base64,
+            mimeType: selfie.mimeType,
+          },
+        });
+      }
+
+      await consumeKycStream(requestBody, (event) => {
+        if (event.type === 'status' || event.type === 'kyc_progress') {
+          const line = event.message ?? event.type;
+          setProgressLog((prev) => [...prev, line]);
+        }
+        if (event.type === 'id_extracted' && event.extraction) {
+          setIdExtraction(event.extraction);
+          setProgressLog((prev) => [
+            ...prev,
+            'ID extraction complete — review fields below.',
+          ]);
+        }
+        if (event.type === 'id_compared' && event.verification) {
+          setIdVerification(event.verification);
+          setProgressLog((prev) => [
+            ...prev,
+            `Form vs ID comparison: ${event.verification.overallStatus.replace(/_/g, ' ')}`,
+          ]);
+        }
+        if (event.type === 'face_cropped' && event.idFacePreview) {
+          setIdFacePreview(event.idFacePreview);
+          setProgressLog((prev) => [
+            ...prev,
+            'Portrait cropped from ID document.',
+          ]);
+        }
+        if (event.type === 'face_compared' && event.faceMatch) {
+          setFaceMatch(event.faceMatch);
+          setProgressLog((prev) => [
+            ...prev,
+            `Face match: ${event.faceMatch.overallStatus.replace(/_/g, ' ')} (${event.faceMatch.confidenceScore}/100)`,
+          ]);
+        }
+        if (event.type === 'error') {
+          throw new Error(event.message ?? 'KYC stream failed');
+        }
+        if (event.type === 'complete' && event.result) {
+          setReport(event.result.report);
+          setApplicantPayload(event.result.applicantPayload ?? null);
+          if (event.result.idExtraction) {
+            setIdExtraction(event.result.idExtraction);
+          }
+          if (event.result.idVerification) {
+            setIdVerification(event.result.idVerification);
+          }
+          if (event.result.faceMatch) {
+            setFaceMatch(event.result.faceMatch);
+          }
+          if (event.result.idFacePreview) {
+            setIdFacePreview(event.result.idFacePreview);
+          }
+          setSelectedDecision(event.result.report.recommendation);
+        }
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -261,8 +525,10 @@ export function App() {
         <section className="panel">
           <h2 className="panel__title">Applicant intake</h2>
           <p className="panel__hint">
-            Complete the form and submit for an AI-assisted KYC assessment
-            against the demo internal registry.
+            Complete the form and optionally upload a national ID image
+            (driving licence, Aadhaar, or passport). KYC always checks the demo
+            registry; with an upload, extracted fields are compared to your form
+            before assessment.
           </p>
           <form className="form" onSubmit={onSubmit}>
             <div className="grid2">
@@ -363,15 +629,156 @@ export function App() {
                 }
               />
             </label>
+
+            <fieldset className="id-upload">
+              <legend>National ID image (optional)</legend>
+              <label className="field">
+                <span>ID document type for upload</span>
+                <select
+                  value={idDocumentKind}
+                  onChange={(e) => {
+                    const kind = e.target.value;
+                    setIdDocumentKind(kind);
+                    const labels: Record<string, string> = {
+                      india_driving_licence: 'India Driving Licence',
+                      india_passport: 'India Passport',
+                      india_aadhaar: 'India Aadhaar',
+                    };
+                    if (labels[kind]) {
+                      setForm((f) => ({
+                        ...f,
+                        idDocumentType: labels[kind]!,
+                      }));
+                    }
+                  }}
+                >
+                  <option value="india_driving_licence">
+                    India — Driving licence
+                  </option>
+                  <option value="india_passport">India — Passport</option>
+                  <option value="india_aadhaar">India — Aadhaar</option>
+                  <option value="other_national_id" disabled>
+                    Other national ID (coming soon)
+                  </option>
+                </select>
+              </label>
+              <p className="muted small">
+                {idDocumentKind === 'india_passport'
+                  ? 'Upload bio page, or one scan with bio + address pages. JPEG, PNG, or WebP, max 8 MB each.'
+                  : idDocumentKind === 'india_aadhaar'
+                    ? 'Upload front, or one image with front+back stacked. Address is usually on the back.'
+                    : 'Use “Front or combined” for one scan (front+back together), or add “Back” as a second file. Either way works.'}
+              </p>
+              <div className="id-upload__row">
+                <label className="field file-field">
+                  <span>Front or combined image</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] ?? null;
+                      setIdFiles((f) => ({ ...f, front: file }));
+                      setIdPreview((p) => ({
+                        ...p,
+                        front: file ? URL.createObjectURL(file) : undefined,
+                      }));
+                    }}
+                  />
+                  {idFiles.front ? (
+                    <span className="file-name">{idFiles.front.name}</span>
+                  ) : null}
+                </label>
+                <label className="field file-field">
+                  <span>Back (optional)</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] ?? null;
+                      setIdFiles((f) => ({ ...f, back: file }));
+                      setIdPreview((p) => ({
+                        ...p,
+                        back: file ? URL.createObjectURL(file) : undefined,
+                      }));
+                    }}
+                  />
+                  {idFiles.back ? (
+                    <span className="file-name">{idFiles.back.name}</span>
+                  ) : null}
+                </label>
+              </div>
+              {(idPreview.front || idPreview.back) && (
+                <div className="id-preview">
+                  {idPreview.front ? (
+                    <img src={idPreview.front} alt="ID front preview" />
+                  ) : null}
+                  {idPreview.back ? (
+                    <img src={idPreview.back} alt="ID back preview" />
+                  ) : null}
+                </div>
+              )}
+            </fieldset>
+
+            {hasIdUpload ? (
+              <fieldset className="id-upload id-upload--selfie">
+                <legend>Live selfie (required with ID)</legend>
+                <p className="muted small">
+                  Demo face match: static photo comparison to the portrait on
+                  your ID — not true video liveness.
+                </p>
+                <label className="field file-field">
+                  <span>Selfie / live photo</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    required={hasIdUpload}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] ?? null;
+                      setSelfieFile(file);
+                      setSelfiePreview(
+                        file ? URL.createObjectURL(file) : undefined,
+                      );
+                      if (file) {
+                        setForm((f) => ({ ...f, selfie: true }));
+                      }
+                    }}
+                  />
+                  {selfieFile ? (
+                    <span className="file-name">{selfieFile.name}</span>
+                  ) : (
+                    <span className="file-name file-name--warn">
+                      Required when ID is uploaded
+                    </span>
+                  )}
+                </label>
+                {(selfiePreview || idFacePreview) && (
+                  <div className="id-preview face-preview-pair">
+                    {idFacePreview ? (
+                      <figure>
+                        <img src={idFacePreview} alt="Face from ID" />
+                        <figcaption>From ID</figcaption>
+                      </figure>
+                    ) : null}
+                    {selfiePreview ? (
+                      <figure>
+                        <img src={selfiePreview} alt="Your selfie" />
+                        <figcaption>Selfie</figcaption>
+                      </figure>
+                    ) : null}
+                  </div>
+                )}
+              </fieldset>
+            ) : null}
+
             <div className="grid2">
               <label className="field">
-                <span>ID document type</span>
+                <span>ID document type (form / registry)</span>
                 <input
                   value={form.idDocumentType}
                   onChange={(e) =>
                     setForm((f) => ({ ...f, idDocumentType: e.target.value }))
                   }
-                  placeholder="Passport, PAN, National ID…"
+                  placeholder="India Driving Licence, Passport, Aadhaar…"
                 />
               </label>
               <label className="field">
@@ -484,6 +891,131 @@ export function App() {
           <section className="panel panel--error">
             <h2 className="panel__title">Error</h2>
             <pre className="pre">{error}</pre>
+          </section>
+        ) : null}
+
+        {loading || progressLog.length > 0 ? (
+          <section className="panel panel--progress">
+            <h2 className="panel__title">Assessment progress</h2>
+            <ul className="progress-log" aria-live="polite">
+              {progressLog.map((line, i) => (
+                <li key={`${i}-${line.slice(0, 24)}`}>{line}</li>
+              ))}
+              {loading ? <li className="progress-log__active">…</li> : null}
+            </ul>
+          </section>
+        ) : null}
+
+        {idExtraction ? (
+          <section className="panel panel--id panel--extract">
+            <h2 className="panel__title">Extracted from ID document</h2>
+            <p className="panel__hint">
+              Vision model output from your upload (before registry KYC).
+            </p>
+            <pre className="pre pre--compact">
+              {JSON.stringify(idExtraction, null, 2)}
+            </pre>
+          </section>
+        ) : null}
+
+        {idVerification ? (
+          <section className="panel panel--id">
+            <h2 className="panel__title">Form vs ID comparison</h2>
+            <p className="panel__hint">
+              Deterministic check of your form entries against the extracted ID
+              fields.
+            </p>
+            <p className="ai-row">
+              <span className="muted">Overall</span>
+              <span
+                className={
+                  idVerification.overallStatus === 'match'
+                    ? 'badge badge--ok'
+                    : idVerification.overallStatus === 'mismatch'
+                      ? 'badge badge--bad'
+                      : 'badge badge--review'
+                }
+              >
+                {idVerification.overallStatus.replace(/_/g, ' ')}
+              </span>
+            </p>
+            {idVerification.documentExpired ?? idVerification.licenseExpired ? (
+              <p className="muted small">
+                Document appears expired per dates on the ID.
+              </p>
+            ) : null}
+            <table className="compare-table">
+              <thead>
+                <tr>
+                  <th>Field</th>
+                  <th>Form</th>
+                  <th>From ID</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {idVerification.fieldResults.map((row) => (
+                  <tr key={row.field}>
+                    <td>{row.field}</td>
+                    <td>{row.formValue || '—'}</td>
+                    <td>{row.idValue || '—'}</td>
+                    <td>
+                      <span className={fieldStatusClass(row.status)}>
+                        {row.status.replace(/_/g, ' ')}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+        ) : null}
+
+        {faceMatch ? (
+          <section className="panel panel--id panel--face">
+            <h2 className="panel__title">Demo face match (selfie vs ID)</h2>
+            <p className="panel__hint">
+              Static photo comparison — not true video liveness. Used by the KYC
+              agent alongside form and registry checks.
+            </p>
+            <p className="ai-row">
+              <span className="muted">Overall</span>
+              <span className={faceMatchBadgeClass(faceMatch.overallStatus)}>
+                {faceMatch.overallStatus.replace(/_/g, ' ')}
+              </span>
+              <span className="muted">Confidence</span>
+              <span className="badge badge--review">
+                {faceMatch.confidenceScore}/100
+              </span>
+            </p>
+            {(idFacePreview || selfiePreview) && (
+              <div className="id-preview face-preview-pair">
+                {idFacePreview ? (
+                  <figure>
+                    <img src={idFacePreview} alt="Portrait cropped from ID" />
+                    <figcaption>From ID</figcaption>
+                  </figure>
+                ) : null}
+                {selfiePreview ? (
+                  <figure>
+                    <img src={selfiePreview} alt="Uploaded selfie" />
+                    <figcaption>Selfie</figcaption>
+                  </figure>
+                ) : null}
+              </div>
+            )}
+            <dl className="face-match-details">
+              <dt>Facial features</dt>
+              <dd className="prose">{faceMatch.facialFeatureNotes}</dd>
+              {faceMatch.livenessNotes ? (
+                <>
+                  <dt>Liveness (demo)</dt>
+                  <dd className="prose muted small">{faceMatch.livenessNotes}</dd>
+                </>
+              ) : null}
+              <dt>Recommendation</dt>
+              <dd className="prose">{faceMatch.recommendation}</dd>
+            </dl>
           </section>
         ) : null}
 
